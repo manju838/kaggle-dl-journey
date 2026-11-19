@@ -1,30 +1,34 @@
 """
-Santa 2026 - Elf Calculator: v1  (backward beam search)
+Santa 2026 - Elf Calculator: v2  (v1 + every held value is a building block)
 
-Change vs v0: v0 built every big number digit by digit in ONE fixed base R (2 instructions
-per digit). v1 works BACKWARDS from the number and, at every step, picks among many moves:
+v1's backward search could only multiply by / add the small digit table. v2's search may use
+EVERY value currently in a box -- the digit table, the starting values and the earlier targets
+kept in the ring -- in every move:
 
-    x = y * m            ->  continue from y = x / m           1 instruction  (m divides x)
-    x = y * m + r        ->  continue from y = (x - r) / m     2 instructions (r held)
-    x = y * m - s        ->  continue from y = (x + s) / m     2 instructions (s held)
+    x = y * a            ->  continue from y = x / a           1 instruction  (a divides x)
+    x = y * a +/- r      ->  continue from y = (x -/+ r) / a   2 instructions (r held)
+    x = y + a            ->  continue from y = x - a           1 instruction
+    x = a - y            ->  continue from y = a - x           1 instruction
+    x = y * y            ->  continue from y = sqrt(x)         1 instruction  (perfect square)
+    x = y * y +/- r      ->  continue from y = isqrt(x)        2 instructions (r held)
 
-with m being ANY value in the digit table (2..half, R, starting values), not only R.
-It keeps the BEAM smallest numbers reached for each instruction count, stops when it reaches
-a value already in a box, and keeps the result only if it beats v0's digit-by-digit chain.
-Everything else (reusing earlier targets, the settings sweep, pruning the sample) is as in v0.
+So "target = earlier target * 7 + 3", "target = earlier * earlier", "target = earlier + small
+chain" are all found by the same search. Per target it also tries v1's table-only chain and
+keeps whichever is shorter.
 
 Folder layout:  elf.py, data/puzzles.csv, data/practice_puzzles.csv, data/sample_submission.csv
 Usage:
-    python elf.py            # practice report, then build submission_v1.csv
+    python elf.py            # practice report, then build submission_v2.csv
     python elf.py practice   # only the practice report
-    python elf.py submit     # only build submission_v1.csv
-submission_v1.csv also takes the best program per puzzle from any earlier submission*.csv
+    python elf.py submit     # only build submission_v2.csv
+submission_v2.csv also takes the best program per puzzle from any earlier submission*.csv
 in this folder, so it is never worse than what you already have.
 """
 from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import sys
 import time
@@ -35,19 +39,19 @@ from typing import Any, Optional
 
 csv.field_size_limit(2**31 - 1)
 
-VERSION = "v1"
+VERSION = "v2"
 DATA_DIR = Path("data")
 OUT_PATH = Path(f"submission_{VERSION}.csv")
 MAX_INSTR, MAX_BYTES = 4096, 131072
 BEAM = 12                                       # bigger = slightly better programs, slower
-HALVES = (1, 2, 3, 4, 8, 12, 16, 24, 32, 36, 40, 44)  # digit-table sizes (bigger usually wins)
+HALVES = (0, 1, 2, 3, 4, 8, 12, 16, 24, 32, 36, 40)  # digit-table sizes (0 = none)
 RINGS = (0, 2, 4, 8, 16, 24)                    # how many recent targets to keep in boxes
-DELTA_TRIES = 2                                 # nearest earlier targets to try "t = earlier +/- diff"
 
 Puzzle = dict[str, Any]
 Program = list[list[Any]]
 Step = tuple[str, int, int]     # (op, other value, side): side 0 = cur op other, 1 = other op cur
 Chain = tuple[int, list[Step]]  # (start value already in a box, forward steps)
+SELF = -1                       # 'other value' meaning "the current value itself" (x = y * y)
 
 
 # ---------------------------------------------------------------- I/O
@@ -241,6 +245,17 @@ def chain_search(n: int, held: dict[int, int], mults: list[int],
                     moves.append((x - a, c + 1, [("+", a, 0)]))
                 elif a > x:
                     moves.append((a - x, c + 1, [("-", a, 1)]))
+            if x >= 4:                               # squares: x = y*y (+/- held r)
+                y = math.isqrt(x)
+                r = x - y * y
+                if r == 0:
+                    moves.append((y, c + 1, [("*", SELF, 0)]))
+                else:
+                    if r in held:
+                        moves.append((y, c + 2, [("*", SELF, 0), ("+", r, 0)]))
+                    s = (y + 1) * (y + 1) - x
+                    if s in held and (y + 1) * (y + 1) <= lim:
+                        moves.append((y + 1, c + 2, [("*", SELF, 0), ("-", s, 0)]))
             for y, cc, st in moves:
                 if best is not None and cc >= best[0]:
                     continue
@@ -269,7 +284,7 @@ def build(p: Puzzle, half: int, n_ring: int, cache: dict[Any, Any]) -> Optional[
     regs: int = p["regs"]
     lim: int = p["limit"]
     prog: Program = []
-    anchors: dict[int, int] = {}
+    anchors: dict[int, int] = {}                   # value -> register for EVERYTHING we hold
     for r, v in enumerate(p["start"]):
         anchors.setdefault(v, r)
     nxt = len(p["start"])
@@ -286,101 +301,71 @@ def build(p: Puzzle, half: int, n_ring: int, cache: dict[Any, Any]) -> Optional[
         return d
 
     try:
-        if 1 not in anchors:
-            anchors[1] = emit("/", 0, 0, new_reg())
-        for dg in range(2, half + 1):
-            if dg not in anchors:
-                anchors[dg] = emit("+", anchors[dg - 1], anchors[1], new_reg())
-        radix = 2 * half
-        if radix not in anchors:
-            anchors[radix] = emit("+", anchors[half], anchors[half], new_reg())
+        if half > 0:                               # half == 0: no digit table at all
+            if 1 not in anchors:
+                anchors[1] = emit("/", 0, 0, new_reg())
+            for dg in range(2, half + 1):
+                if dg not in anchors:
+                    anchors[dg] = emit("+", anchors[dg - 1], anchors[1], new_reg())
+            radix = 2 * half
+            if radix not in anchors:
+                anchors[radix] = emit("+", anchors[half], anchors[half], new_reg())
         acc = new_reg()
         ring = [new_reg() for _ in range(n_ring)]
     except IndexError:
         return None
-    fixed = dict(anchors)
+    fixed = dict(anchors)                          # digit table + starting values (never overwritten)
     have = set(anchors)
 
     if ("one", half) not in cache:
         cache[("one", half)] = one_op_table(fixed, lim)
     one_fixed: dict[int, tuple[int, Step]] = cache[("one", half)]
-    mults = sorted(v for v in fixed if v >= 2)
+    fixed_mults = sorted(v for v in fixed if v >= 2)
 
-    def chain(n: int) -> Chain:
+    def fixed_chain(n: int) -> Optional[Chain]:
+        """v1's chain: digit table only (cached, it doesn't depend on the ring)."""
         key = ("chain", half, n)
         if key not in cache:
-            h = horner_chain(n, half)
-            s = chain_search(n, fixed, mults, one_fixed, [], lim, BEAM)
-            cache[key] = s if s is not None and len(s[1]) < len(h[1]) else h
+            s = chain_search(n, fixed, fixed_mults, one_fixed, [], lim, BEAM)
+            if half > 0:
+                h = horner_chain(n, half)
+                s = s if s is not None and len(s[1]) < len(h[1]) else h
+            cache[key] = s
         return cache[key]
 
-    def emit_chain(ch: Chain, dest: int) -> int:
-        """Emit a chain; returns the register holding the result."""
+    def emit_chain(ch: Chain, dest: int) -> None:
         y0, steps = ch
-        cur = fixed[y0]
+        cur = anchors[y0]
         value = y0
         for k, (op, other, side) in enumerate(steps):
             d = dest if k == len(steps) - 1 else acc
-            ro = fixed[other]
-            if side == 0:
-                emit(op, cur, ro, d)
+            if other == SELF:
+                emit(op, cur, cur, d)
+                value = apply_op(op, value, value)
+            elif side == 0:
+                emit(op, cur, anchors[other], d)
                 value = apply_op(op, value, other)
             else:
-                emit(op, ro, cur, d)
+                emit(op, anchors[other], cur, d)
                 value = apply_op(op, other, value)
             have.add(value)
             cur = d
-        return cur
 
     slot = 0
     for t in p["targets"]:
         if t in have:
             continue
         dest = ring[slot % n_ring] if n_ring else acc
-
-        # option: from scratch
-        scratch = chain(t)
-        best_cost = len(scratch[1])
-        plan: tuple[str, int, int, int] = ("scratch", 0, 0, 0)
-        # option: one instruction / v*k +/- small (as in v0)
-        for v, rv in anchors.items():
-            if t > v and (t - v) in anchors:
-                best_cost, plan = 1, ("op", rv, anchors[t - v], 0)
-            elif v > t and (v - t) in anchors:
-                best_cost, plan = 1, ("op", rv, anchors[v - t], 1)
-            elif t % v == 0 and (t // v) in anchors:
-                best_cost, plan = 1, ("op", rv, anchors[t // v], 2)
-            elif v % t == 0 and (v // t) in anchors:
-                best_cost, plan = 1, ("op", rv, anchors[v // t], 3)
-            if best_cost == 1:
-                break
-            for k in (t // v, t // v + 1):
-                if k > 1 and k in anchors and v * k <= lim:
-                    e = t - v * k
-                    if e and abs(e) <= half and best_cost > 2:
-                        best_cost, plan = 2, ("muladj", rv, anchors[k], e)
-        # option: earlier target +/- difference (try the few with the cheapest-looking difference)
-        if best_cost > 2:
-            near = sorted(((horner_cost(abs(t - v), radix), v) for v in anchors
-                           if v != t and (t > v or v - t < v)))[:DELTA_TRIES]
-            for _, v in near:
-                delta = abs(t - v)
-                c = 1 + (0 if delta in fixed else len(chain(delta)[1]))
-                if c < best_cost:
-                    best_cost, plan = c, ("delta", anchors[v], delta, int(t > v))
-
-        kind, a, b, c = plan
-        if kind == "scratch":
-            emit_chain(scratch, dest)
-        elif kind == "op":
-            emit("+-*/"[c], a, b, dest)
-        elif kind == "muladj":
-            emit("*", a, b, acc)
-            emit("+" if c > 0 else "-", acc, fixed[abs(c)], dest)
-        else:
-            s = fixed[b] if b in fixed else emit_chain(chain(b), acc)
-            emit("+" if c else "-", a, s, dest)
-
+        best = fixed_chain(t)
+        if best is None or len(best[1]) > 1:
+            mults = sorted(v for v in anchors if v >= 2)
+            offsets = [v for v in anchors if v not in fixed or v > half]
+            full = chain_search(t, anchors, mults, one_fixed, offsets, lim, BEAM)
+            if full is not None and (best is None or len(full[1]) < len(best[1])):
+                best = full
+        if best is None:
+            return None                            # this setting can't build t; try another
+        emit_chain(best, dest)
         if n_ring:
             anchors = {v: r for v, r in anchors.items() if r != dest}
             anchors[t] = dest
