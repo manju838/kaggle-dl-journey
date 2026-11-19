@@ -133,7 +133,7 @@ The following program covers all four targets in four instructions:
 ## Initial Thoughts by Me
 
 - There are 1000 puzzles(analogous to samples in testset)
-- Elf Calculator is like the memory of microprocessoor with 48 memory slots each of 128KB.
+- Elf Calculator is like the memory of microprocessoor with 48 memory slots each of 131,072 bytes/128KB.
 - Basic Action/instruction is [Operator, First_Memory_Address, Second_Memory_Address, Target_Memory_Address], $operator \in [+,-,*,/]$ and the result is noted in target address, so no calculating once and pasting multiple times to save instructions/actions
 - Target_Memory_Address may be one of the source addresses
 - Max 4096 instructions per puzzle/sample
