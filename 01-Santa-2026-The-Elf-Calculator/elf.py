@@ -1,28 +1,29 @@
 """
-Santa 2026 - Elf Calculator: v2  (v1 + every held value is a building block)
+Santa 2026 - Elf Calculator: v3  (two-step dictionary + register reuse)
 
-v1's backward search could only multiply by / add the small digit table. v2's search may use
-EVERY value currently in a box -- the digit table, the starting values and the earlier targets
-kept in the ring -- in every move:
+What changed vs v2 (the idea behind most top public notebooks, e.g. Tony Li's
+"Elf Calculator With Register Reuse"):
 
-    x = y * a            ->  continue from y = x / a           1 instruction  (a divides x)
-    x = y * a +/- r      ->  continue from y = (x -/+ r) / a   2 instructions (r held)
-    x = y + a            ->  continue from y = x - a           1 instruction
-    x = a - y            ->  continue from y = a - x           1 instruction
-    x = y * y            ->  continue from y = sqrt(x)         1 instruction  (perfect square)
-    x = y * y +/- r      ->  continue from y = isqrt(x)        2 instructions (r held)
-
-So "target = earlier target * 7 + 3", "target = earlier * earlier", "target = earlier + small
-chain" are all found by the same search. Per target it also tries v1's table-only chain and
-keeps whichever is shorter.
+  1. DICTIONARY. Before each target, list every value reachable with ONE instruction from two
+     values already in registers (a+b, a-b, a*b, a/b): ~4,600 values with 48 full registers.
+  2. BACKWARD BEAM SEARCH over registers AND dictionary. Moves from the number x we still need:
+        x = y * m            -> y = x / m
+        x = y * m +/- r      -> y = (x -/+ r) / m
+        x = y + a, x = a - y -> y = x - a, y = a - x
+        x = y * y (+/- r)    -> y = isqrt(x)
+     with m, r, a ANY register value (free) or dictionary value (+1 instruction to build it).
+     numpy scans all ~5,000 candidates per step at once.
+  3. REGISTER REUSE. Every value computed (helpers, intermediates, targets) stays in a register
+     until that register is needed; the least-recently-used value is evicted first. Later targets
+     therefore reuse earlier work.
 
 Folder layout:  elf.py, data/puzzles.csv, data/practice_puzzles.csv, data/sample_submission.csv
 Usage:
-    python elf.py            # practice report, then build submission_v2.csv
+    python elf.py            # practice report, then build submission_v3.csv
     python elf.py practice   # only the practice report
-    python elf.py submit     # only build submission_v2.csv
-submission_v2.csv also takes the best program per puzzle from any earlier submission*.csv
-in this folder, so it is never worse than what you already have.
+    python elf.py submit     # only build submission_v3.csv
+submission_v3.csv also keeps the best program per puzzle from any earlier submission*.csv in
+this folder, so it is never worse than what you already have.
 """
 from __future__ import annotations
 
@@ -37,21 +38,21 @@ from multiprocessing import Pool
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
+
 csv.field_size_limit(2**31 - 1)
 
-VERSION = "v2"
+VERSION = "v3"
 DATA_DIR = Path("data")
 OUT_PATH = Path(f"submission_{VERSION}.csv")
 MAX_INSTR, MAX_BYTES = 4096, 131072
-BEAM = 12                                       # bigger = slightly better programs, slower
-HALVES = (0, 1, 2, 3, 4, 8, 12, 16, 24, 32, 36, 40)  # digit-table sizes (0 = none)
-RINGS = (0, 2, 4, 8, 16, 24)                    # how many recent targets to keep in boxes
+SETTINGS = [  # (beam width, keep starting values pinned, size of the digit table built first)
+    (8, True, 0), (8, False, 0), (8, True, 6), (8, True, 12), (8, True, 20), (24, True, 0), (24, True, 12),
+]
+MAX_COST = 60
 
 Puzzle = dict[str, Any]
 Program = list[list[Any]]
-Step = tuple[str, int, int]     # (op, other value, side): side 0 = cur op other, 1 = other op cur
-Chain = tuple[int, list[Step]]  # (start value already in a box, forward steps)
-SELF = -1                       # 'other value' meaning "the current value itself" (x = y * y)
 
 
 # ---------------------------------------------------------------- I/O
@@ -157,236 +158,353 @@ def prune(p: Puzzle, prog: Program) -> Program:
     return [ins for k, ins in enumerate(prog) if k in keep]
 
 
-# ---------------------------------------------------------------- chains: ways to build one number
-def signed_digits(n: int, radix: int) -> tuple[int, list[int]]:
-    half = radix // 2
-    ds: list[int] = []
-    while n > half:
-        e = n % radix
-        if e > half:
-            e -= radix
-        n = (n - e) // radix
-        ds.append(e)
-    return n, ds[::-1]
+# ---------------------------------------------------------------- the dictionary
+class Catalog:
+    """Register values (cost 0) + every value one instruction away from them (cost 1)."""
+
+    def __init__(self, held: dict[int, int], lim: int):
+        hv = np.array(sorted(held), dtype=np.int64)
+        n = len(hv)
+        A = np.repeat(hv, n)
+        B = np.tile(hv, n)
+        lo_le = A <= B                                     # each unordered pair once for + and *
+        parts_v, parts_op, parts_a, parts_b = [], [], [], []
+
+        def add(mask: np.ndarray, vals: np.ndarray, op: int) -> None:
+            parts_v.append(vals[mask]); parts_op.append(np.full(int(mask.sum()), op, dtype=np.int8))
+            parts_a.append(A[mask]); parts_b.append(B[mask])
+
+        s = A + B
+        add(lo_le & (s <= lim), s, 0)
+        safe = (A.astype(np.float64) * B.astype(np.float64)) < 4.0e18
+        pr = np.where(safe, A * B, 0)
+        add(lo_le & safe & (pr <= lim) & (A > 1) & (B > 1), pr, 2)
+        d = A - B
+        add(d > 0, d, 1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            exact = (B > 1) & (A % np.where(B == 0, 1, B) == 0) & (A >= B)
+        add(exact, np.where(exact, A // np.where(B == 0, 1, B), 0), 3)
+
+        dv = np.concatenate(parts_v) if parts_v else np.zeros(0, dtype=np.int64)
+        dop = np.concatenate(parts_op) if parts_op else np.zeros(0, dtype=np.int8)
+        da = np.concatenate(parts_a) if parts_a else np.zeros(0, dtype=np.int64)
+        db = np.concatenate(parts_b) if parts_b else np.zeros(0, dtype=np.int64)
+        keep = ~np.isin(dv, hv)
+        dv, dop, da, db = dv[keep], dop[keep], da[keep], db[keep]
+        dv, first = np.unique(dv, return_index=True)
+        self.recipe_op, self.recipe_a, self.recipe_b = dop[first], da[first], db[first]
+        self.dict_vals = dv
+
+        allv = np.concatenate([hv, dv])
+        cost = np.concatenate([np.zeros(n, dtype=np.int64), np.ones(len(dv), dtype=np.int64)])
+        order = np.argsort(allv, kind="stable")
+        self.vals = allv[order]
+        self.cost = cost[order]
+        self.held = held
+
+    def lookup(self, x: np.ndarray) -> np.ndarray:
+        """Cost of each value in x: 0 held, 1 dictionary, -1 unknown."""
+        idx = np.searchsorted(self.vals, x)
+        idx = np.minimum(idx, len(self.vals) - 1)
+        hit = self.vals[idx] == x
+        return np.where(hit, self.cost[idx], -1)
+
+    def cost_of(self, v: int) -> int:
+        if v in self.held:
+            return 0
+        i = int(np.searchsorted(self.dict_vals, v))
+        return 1 if i < len(self.dict_vals) and int(self.dict_vals[i]) == v else -1
+
+    def recipe(self, v: int) -> tuple[str, int, int]:
+        i = int(np.searchsorted(self.dict_vals, v))
+        return "+-*/"[int(self.recipe_op[i])], int(self.recipe_a[i]), int(self.recipe_b[i])
 
 
-def horner_cost(n: int, radix: int) -> int:
-    if n <= radix // 2:
-        return 0
-    _, ds = signed_digits(n, radix)
-    return len(ds) + sum(1 for e in ds if e)
+# A forward step applied to the current value `cur`:
+#   ("*", m, 0)  cur*m          ("*+", m, r) cur*m + r     ("*-", m, s) cur*m - s
+#   ("+", a, 0)  cur + a        ("r-", a, 0) a - cur
+#   ("sq", 0, 0) cur*cur        ("sq+", 0, r) cur*cur + r  ("sq-", 0, s) cur*cur - s
+Step = tuple[str, int, int]
 
 
-def horner_chain(n: int, half: int) -> Chain:
-    """v0's method: digit by digit in base 2*half."""
-    radix = 2 * half
-    top, ds = signed_digits(n, radix)
-    steps: list[Step] = []
-    for e in ds:
-        steps.append(("*", radix, 0))
-        if e:
-            steps.append(("+" if e > 0 else "-", abs(e), 0))
-    return top, steps
-
-
-def one_op_table(held: dict[int, int], lim: int) -> dict[int, tuple[int, Step]]:
-    """Every value reachable with ONE instruction from two held values."""
-    out: dict[int, tuple[int, Step]] = {}
-    vals = sorted(held)
-    for a in vals:
-        for b in vals:
-            for v, st in ((a + b, ("+", b, 0)), (a * b, ("*", b, 0)),
-                          (a - b, ("-", b, 0)), (a // b if a % b == 0 else 0, ("/", b, 0))):
-                if 1 <= v <= lim and v not in held and v not in out:
-                    out[v] = (a, st)
-    return out
-
-
-def chain_search(n: int, held: dict[int, int], mults: list[int],
-                 one_op: dict[int, tuple[int, Step]], offsets: list[int],
-                 lim: int, beam: int) -> Optional[Chain]:
-    """Backward beam search for a short recipe that builds n from values already held.
-
-    held    : value -> register of everything we may read
-    mults   : sorted values we may multiply by (all >= 2, all held)
-    offsets : extra held values usable as 'x = y + a' or 'x = a - y' (v2 uses this; v1 passes [])
-    """
-    if n in held:
+def search(n: int, cat: Catalog, lim: int, beam: int) -> Optional[tuple[int, list[Step]]]:
+    """Backward beam search. Returns (start value, forward steps) or None."""
+    c0 = cat.cost_of(n)
+    if c0 >= 0:
         return (n, [])
-    cost_of: dict[int, int] = {n: 0}
-    parent: dict[int, tuple[int, list[Step]]] = {}
-    levels: dict[int, list[int]] = defaultdict(list)
-    levels[0].append(n)
-    best: Optional[tuple[int, int, list[Step], int]] = None   # cost, start value, first steps, attach
+    vals, vcost = cat.vals, cat.cost
+    best_cost: dict[int, int] = {n: 0}
+    parent: dict[int, tuple[int, Step]] = {}
+    levels: dict[int, dict[int, None]] = defaultdict(dict)
+    levels[0][n] = None
+    found: Optional[tuple[int, int]] = None          # (total cost, terminal value)
     c = 0
-    while c < 200 and (best is None or c < best[0]):
-        xs = sorted({x for x in levels.pop(c, []) if cost_of[x] == c})[:beam]
+    while c < MAX_COST and (found is None or c < found[0]):
+        xs = sorted(x for x in levels.pop(c, {}) if best_cost.get(x) == c)[:beam]
         if not xs and not levels:
             break
         for x in xs:
-            if x in one_op and (best is None or c + 1 < best[0]):
-                y0, st = one_op[x]
-                best = (c + 1, y0, [st], x)
-            moves: list[tuple[int, int, list[Step]]] = []
-            for m in mults:
-                if m > x:
-                    break
-                q, r = divmod(x, m)
-                if r == 0:
-                    moves.append((q, c + 1, [("*", m, 0)]))
-                    continue
-                if r in held:
-                    moves.append((q, c + 2, [("*", m, 0), ("+", r, 0)]))
+            cand_y: list[np.ndarray] = []
+            cand_c: list[np.ndarray] = []
+            cand_k: list[np.ndarray] = []
+            cand_m: list[np.ndarray] = []
+            cand_r: list[np.ndarray] = []
+            hi = int(np.searchsorted(vals, x, side="right"))
+            lo = int(np.searchsorted(vals, 2))
+            m = vals[lo:hi]
+            mc = vcost[lo:hi]
+            if len(m):
+                q = x // m
+                r = x - q * m
+                z = r == 0
+                cand_y.append(q[z]); cand_c.append(c + 1 + mc[z]); cand_k.append(np.zeros(int(z.sum()), np.int8))
+                cand_m.append(m[z]); cand_r.append(np.zeros(int(z.sum()), np.int64))
+                nz = ~z
+                rc = cat.lookup(r)
+                ok = nz & (rc >= 0) & (q >= 1)
+                cand_y.append(q[ok]); cand_c.append(c + 2 + mc[ok] + rc[ok]); cand_k.append(np.ones(int(ok.sum()), np.int8))
+                cand_m.append(m[ok]); cand_r.append(r[ok])
                 s = m - r
-                if s in held and (q + 1) * m <= lim:
-                    moves.append((q + 1, c + 2, [("*", m, 0), ("-", s, 0)]))
-            for a in offsets:
-                if a < x:
-                    moves.append((x - a, c + 1, [("+", a, 0)]))
-                elif a > x:
-                    moves.append((a - x, c + 1, [("-", a, 1)]))
-            if x >= 4:                               # squares: x = y*y (+/- held r)
-                y = math.isqrt(x)
-                r = x - y * y
-                if r == 0:
-                    moves.append((y, c + 1, [("*", SELF, 0)]))
-                else:
-                    if r in held:
-                        moves.append((y, c + 2, [("*", SELF, 0), ("+", r, 0)]))
-                    s = (y + 1) * (y + 1) - x
-                    if s in held and (y + 1) * (y + 1) <= lim:
-                        moves.append((y + 1, c + 2, [("*", SELF, 0), ("-", s, 0)]))
-            for y, cc, st in moves:
-                if best is not None and cc >= best[0]:
-                    continue
-                if cost_of.get(y, 1 << 30) <= cc:
-                    continue
-                cost_of[y] = cc
-                parent[y] = (x, st)
-                if y in held:
-                    best = (cc, y, [], y)
-                else:
-                    levels[cc].append(y)
+                sc = cat.lookup(s)
+                ok2 = nz & (sc >= 0) & ((q + 1) * m <= lim)
+                cand_y.append(q[ok2] + 1); cand_c.append(c + 2 + mc[ok2] + sc[ok2]); cand_k.append(np.full(int(ok2.sum()), 2, np.int8))
+                cand_m.append(m[ok2]); cand_r.append(s[ok2])
+            # offsets: x = y + a  /  x = a - y
+            hi_l = int(np.searchsorted(vals, x, side="left"))
+            a_lo = vals[:hi_l]
+            if len(a_lo):
+                ac = vcost[:hi_l]
+                cand_y.append(x - a_lo); cand_c.append(c + 1 + ac); cand_k.append(np.full(len(a_lo), 3, np.int8))
+                cand_m.append(a_lo); cand_r.append(np.zeros(len(a_lo), np.int64))
+            a_hi = vals[hi:]
+            if len(a_hi):
+                ah = vcost[hi:]
+                cand_y.append(a_hi - x); cand_c.append(c + 1 + ah); cand_k.append(np.full(len(a_hi), 4, np.int8))
+                cand_m.append(a_hi); cand_r.append(np.zeros(len(a_hi), np.int64))
+            Y = np.concatenate(cand_y)
+            C = np.concatenate(cand_c)
+            K = np.concatenate(cand_k)
+            M = np.concatenate(cand_m)
+            Rr = np.concatenate(cand_r)
+            good = Y >= 1
+            Y, C, K, M, Rr = Y[good], C[good], K[good], M[good], Rr[good]
+            if found is not None:
+                g = C < found[0]
+                Y, C, K, M, Rr = Y[g], C[g], K[g], M[g], Rr[g]
+            if not len(Y):
+                pass
+            else:
+                tc = cat.lookup(Y)
+                term = tc >= 0
+                if term.any():
+                    tot = C[term] + tc[term]
+                    k = int(np.argmin(tot))
+                    if found is None or int(tot[k]) < found[0]:
+                        yy = int(Y[term][k])
+                        st = _step(int(K[term][k]), int(M[term][k]), int(Rr[term][k]))
+                        if best_cost.get(yy, 1 << 30) > int(C[term][k]):
+                            best_cost[yy] = int(C[term][k])
+                            parent[yy] = (x, st)
+                        found = (int(tot[k]), yy)
+                rest = ~term
+                Y, C, K, M, Rr = Y[rest], C[rest], K[rest], M[rest], Rr[rest]
+                for cc in np.unique(C):
+                    sel = np.nonzero(C == cc)[0]
+                    if len(sel) > beam:
+                        sel = sel[np.argpartition(Y[sel], beam)[:beam]]
+                    for i in sel:
+                        yy = int(Y[i])
+                        ci = int(cc)
+                        if best_cost.get(yy, 1 << 30) <= ci:
+                            continue
+                        best_cost[yy] = ci
+                        parent[yy] = (x, _step(int(K[i]), int(M[i]), int(Rr[i])))
+                        levels[ci][yy] = None
+            # squares
+            if x >= 4:
+                yq = math.isqrt(x)
+                for yy, cc, st in _square_moves(x, yq, c, cat, lim):
+                    tcy = cat.cost_of(yy)
+                    if tcy >= 0:
+                        if found is None or cc + tcy < found[0]:
+                            if best_cost.get(yy, 1 << 30) > cc:
+                                best_cost[yy] = cc
+                                parent[yy] = (x, st)
+                            found = (cc + tcy, yy)
+                    elif best_cost.get(yy, 1 << 30) > cc:
+                        best_cost[yy] = cc
+                        parent[yy] = (x, st)
+                        levels[cc][yy] = None
         c += 1
-    if best is None:
+    if found is None:
         return None
-    _, y0, first, v = best
-    steps = list(first)
+    _, v = found
+    steps: list[Step] = []
     while v != n:
         px, st = parent[v]
-        steps.extend(st)
+        steps.append(st)
         v = px
-    return (y0, steps)
+    return (found[1], steps)
+
+
+def _step(kind: int, m: int, r: int) -> Step:
+    return (("*", "*+", "*-", "+", "r-")[kind], m, r)
+
+
+def _square_moves(x: int, y: int, c: int, cat: Catalog, lim: int) -> list[tuple[int, int, Step]]:
+    out: list[tuple[int, int, Step]] = []
+    r = x - y * y
+    if r == 0:
+        out.append((y, c + 1, ("sq", 0, 0)))
+        return out
+    rc = cat.cost_of(r)
+    if rc >= 0:
+        out.append((y, c + 2 + rc, ("sq+", 0, r)))
+    s = (y + 1) * (y + 1) - x
+    sc = cat.cost_of(s)
+    if sc >= 0 and (y + 1) * (y + 1) <= lim:
+        out.append((y + 1, c + 2 + sc, ("sq-", 0, s)))
+    return out
 
 
 # ---------------------------------------------------------------- program builder
-def build(p: Puzzle, half: int, n_ring: int, cache: dict[Any, Any]) -> Optional[Program]:
-    regs: int = p["regs"]
-    lim: int = p["limit"]
-    prog: Program = []
-    anchors: dict[int, int] = {}                   # value -> register for EVERYTHING we hold
-    for r, v in enumerate(p["start"]):
-        anchors.setdefault(v, r)
-    nxt = len(p["start"])
+class Machine:
+    """Registers with least-recently-used eviction."""
 
-    def new_reg() -> int:
-        nonlocal nxt
-        if nxt >= regs:
-            raise IndexError
-        nxt += 1
-        return nxt - 1
+    def __init__(self, p: Puzzle, pin_starts: bool):
+        self.n: int = p["regs"]
+        self.lim: int = p["limit"]
+        self.reg: list[Optional[int]] = [None] * self.n
+        self.where: dict[int, int] = {}
+        self.stamp = [0] * self.n
+        self.clock = 0
+        self.prog: Program = []
+        self.seen: set[int] = set(p["start"])
+        self.pinned: set[int] = set()
+        for r, v in enumerate(p["start"]):
+            self.reg[r] = v
+            self.where.setdefault(v, r)
+            if pin_starts:
+                self.pinned.add(r)
 
-    def emit(op: str, i: int, j: int, d: int) -> int:
-        prog.append([op, i, j, d])
-        return d
+    def touch(self, r: int) -> None:
+        self.clock += 1
+        self.stamp[r] = self.clock
 
-    try:
-        if half > 0:                               # half == 0: no digit table at all
-            if 1 not in anchors:
-                anchors[1] = emit("/", 0, 0, new_reg())
-            for dg in range(2, half + 1):
-                if dg not in anchors:
-                    anchors[dg] = emit("+", anchors[dg - 1], anchors[1], new_reg())
-            radix = 2 * half
-            if radix not in anchors:
-                anchors[radix] = emit("+", anchors[half], anchors[half], new_reg())
-        acc = new_reg()
-        ring = [new_reg() for _ in range(n_ring)]
-    except IndexError:
-        return None
-    fixed = dict(anchors)                          # digit table + starting values (never overwritten)
-    have = set(anchors)
+    def alloc(self, protect: set[int]) -> int:
+        for r in range(self.n):
+            if self.reg[r] is None:
+                return r
+        cands = [r for r in range(self.n) if r not in self.pinned and self.reg[r] not in protect]
+        if not cands:
+            raise IndexError("no free register")
+        return min(cands, key=lambda r: self.stamp[r])
 
-    if ("one", half) not in cache:
-        cache[("one", half)] = one_op_table(fixed, lim)
-    one_fixed: dict[int, tuple[int, Step]] = cache[("one", half)]
-    fixed_mults = sorted(v for v in fixed if v >= 2)
+    def emit(self, op: str, a: int, b: int, protect: set[int]) -> int:
+        """Compute value(a) op value(b) into a register; returns the new value."""
+        ra, rb = self.where[a], self.where[b]
+        v = apply_op(op, a, b)
+        if v in self.where:                       # already held: nothing to do
+            self.touch(self.where[v])
+            return v
+        d = self.alloc(protect | {a, b})
+        old = self.reg[d]
+        if old is not None and self.where.get(old) == d:
+            del self.where[old]
+            for r2 in range(self.n):              # another register may hold the same value
+                if r2 != d and self.reg[r2] == old:
+                    self.where[old] = r2
+                    break
+        self.prog.append([op, ra, rb, d])
+        self.reg[d] = v
+        self.where[v] = d
+        self.touch(ra); self.touch(rb); self.touch(d)
+        self.seen.add(v)
+        return v
 
-    def fixed_chain(n: int) -> Optional[Chain]:
-        """v1's chain: digit table only (cached, it doesn't depend on the ring)."""
-        key = ("chain", half, n)
-        if key not in cache:
-            s = chain_search(n, fixed, fixed_mults, one_fixed, [], lim, BEAM)
-            if half > 0:
-                h = horner_chain(n, half)
-                s = s if s is not None and len(s[1]) < len(h[1]) else h
-            cache[key] = s
-        return cache[key]
+    def ensure(self, v: int, cat: Catalog, protect: set[int]) -> None:
+        """Make sure value v is in a register (build it from its dictionary recipe if needed)."""
+        if v in self.where:
+            self.touch(self.where[v])
+            return
+        op, a, b = cat.recipe(v)
+        self.emit(op, a, b, protect)
 
-    def emit_chain(ch: Chain, dest: int) -> None:
-        y0, steps = ch
-        cur = anchors[y0]
-        value = y0
-        for k, (op, other, side) in enumerate(steps):
-            d = dest if k == len(steps) - 1 else acc
-            if other == SELF:
-                emit(op, cur, cur, d)
-                value = apply_op(op, value, value)
-            elif side == 0:
-                emit(op, cur, anchors[other], d)
-                value = apply_op(op, value, other)
-            else:
-                emit(op, anchors[other], cur, d)
-                value = apply_op(op, other, value)
-            have.add(value)
-            cur = d
 
-    slot = 0
+def build(p: Puzzle, beam: int, pin_starts: bool, table: int = 0) -> Optional[Program]:
+    mach = Machine(p, pin_starts)
+    lim = mach.lim
+    if table:                                        # digits 1..table, kept in registers for good
+        try:
+            if 1 not in mach.where:
+                mach.emit("/", p["start"][0], p["start"][0], set())
+            for d in range(2, table + 1):
+                if d not in mach.where:
+                    mach.emit("+", d - 1, 1, set())
+        except (IndexError, KeyError, ValueError):
+            return None
+        mach.pinned |= {mach.where[d] for d in range(1, table + 1) if d in mach.where}
     for t in p["targets"]:
-        if t in have:
+        if t in mach.seen:
             continue
-        dest = ring[slot % n_ring] if n_ring else acc
-        best = fixed_chain(t)
-        if best is None or len(best[1]) > 1:
-            mults = sorted(v for v in anchors if v >= 2)
-            offsets = [v for v in anchors if v not in fixed or v > half]
-            full = chain_search(t, anchors, mults, one_fixed, offsets, lim, BEAM)
-            if full is not None and (best is None or len(full[1]) < len(best[1])):
-                best = full
-        if best is None:
-            return None                            # this setting can't build t; try another
-        emit_chain(best, dest)
-        if n_ring:
-            anchors = {v: r for v, r in anchors.items() if r != dest}
-            anchors[t] = dest
-            slot += 1
-        have.add(t)
-    return prog
+        held = {v: r for v, r in mach.where.items()}
+        cat = Catalog(held, lim)
+        res = search(t, cat, lim, beam)
+        if res is None:
+            return None
+        y0, steps = res
+        # values the chain needs: start, every m / r / a
+        needed = {y0} | {m for _, m, _ in steps if m} | {r for _, _, r in steps if r}
+        dict_needed = [v for v in needed if v not in held]
+        recipe_operands = set()
+        for v in dict_needed:
+            _, a, b = cat.recipe(v)
+            recipe_operands |= {a, b}
+        protect = set(needed) | recipe_operands
+        try:
+            for v in dict_needed:
+                mach.ensure(v, cat, protect)
+            cur = y0
+            for k, (kind, m, r) in enumerate(steps):
+                live = protect | {cur}
+                if kind == "*":
+                    cur = mach.emit("*", cur, m, live)
+                elif kind == "*+":
+                    mid = mach.emit("*", cur, m, live)
+                    cur = mach.emit("+", mid, r, live | {mid})
+                elif kind == "*-":
+                    mid = mach.emit("*", cur, m, live)
+                    cur = mach.emit("-", mid, r, live | {mid})
+                elif kind == "+":
+                    cur = mach.emit("+", cur, m, live)
+                elif kind == "r-":
+                    cur = mach.emit("-", m, cur, live)
+                elif kind == "sq":
+                    cur = mach.emit("*", cur, cur, live)
+                elif kind == "sq+":
+                    mid = mach.emit("*", cur, cur, live)
+                    cur = mach.emit("+", mid, r, live | {mid})
+                else:  # "sq-"
+                    mid = mach.emit("*", cur, cur, live)
+                    cur = mach.emit("-", mid, r, live | {mid})
+        except (IndexError, KeyError, ValueError):
+            return None
+        if cur != t or len(mach.prog) > MAX_INSTR:
+            return None
+    return mach.prog
 
 
 def solve(p: Puzzle) -> Optional[Program]:
     best: Optional[Program] = None
-    cache: dict[Any, Any] = {}
-    for half in HALVES:
-        for n_ring in RINGS:
-            prog = build(p, half, n_ring, cache)
-            if prog is None or (best is not None and len(prog) >= len(best)):
-                continue
-            try:
-                verify(p, prog)
-                best = prog
-            except ValueError:
-                pass
+    for beam, pin, table in SETTINGS:
+        prog = build(p, beam, pin, table)
+        if prog is None or (best is not None and len(prog) >= len(best)):
+            continue
+        try:
+            verify(p, prog)
+            best = prog
+        except ValueError:
+            pass
     return best
 
 
@@ -399,7 +517,7 @@ def solve_all(puzzles: list[Puzzle]) -> dict[str, Optional[Program]]:
     out: dict[str, Optional[Program]] = {}
     t0 = time.time()
     with Pool(os.cpu_count() or 1) as pool:
-        for k, (pid, prog) in enumerate(pool.imap_unordered(_solve_task, puzzles, chunksize=2)):
+        for k, (pid, prog) in enumerate(pool.imap_unordered(_solve_task, puzzles, chunksize=1)):
             out[pid] = prog
             if (k + 1) % 50 == 0 or k + 1 == len(puzzles):
                 print(f"  {k + 1}/{len(puzzles)} puzzles  ({time.time() - t0:.0f}s)", flush=True)
